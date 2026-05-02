@@ -2,7 +2,14 @@ const LostFound = require("../models/LostFound");
 const User = require("../models/User");
 const cloudinary = require("../config/cloudinary");
 const initGemini = require("../config/gemini");
-const sendEmail = require("../utils/sendEmail");
+const { sendEmail } = require("../utils/sendEmail");
+const {
+  findNearbyItems,
+  matchItems,
+} = require("../services/lostFoundService");
+const {
+  normalizeVerificationInput,
+} = require("../services/lostFoundClaimService");
 
 const gemini = initGemini();
 
@@ -14,6 +21,11 @@ const extractGeminiText = (response) => {
   if (typeof response === "string") return response;
   if (response.text) return response.text;
   if (response.outputText) return response.outputText;
+  if (response.candidates?.[0]?.content?.parts?.[0]?.text)
+    return response.candidates[0].content.parts
+      .map((part) => part.text)
+      .filter(Boolean)
+      .join("\n");
   if (response.message?.content) return response.message.content;
   if (response.choices?.[0]?.message?.content)
     return response.choices[0].message.content;
@@ -37,39 +49,114 @@ const uploadPhotoToCloudinary = async (file) => {
   return uploadResponse.secure_url || uploadResponse.url;
 };
 
+const safeJsonParse = (value) => {
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return null;
+  }
+};
+
+const normalizeLocationPayload = (body) => {
+  const coordinates =
+    typeof body.coordinates === "string"
+      ? safeJsonParse(body.coordinates)
+      : body.coordinates;
+  const lat =
+    coordinates?.lat ??
+    coordinates?.latitude ??
+    body.lat ??
+    body.latitude;
+  const lng =
+    coordinates?.lng ??
+    coordinates?.lon ??
+    coordinates?.longitude ??
+    body.lng ??
+    body.lon ??
+    body.longitude;
+
+  if (lat === undefined || lng === undefined) {
+    return body;
+  }
+
+  return {
+    ...body,
+    coordinates: {
+      lat: Number(lat),
+      lng: Number(lng),
+    },
+  };
+};
+
 const createLostFound = async (req, res) => {
-  const imageUrl = req.file
-    ? await uploadPhotoToCloudinary(req.file)
-    : req.body.imageUrl;
+  let imageUrl = req.body.imageUrl || null;
+  if (req.file) {
+    try {
+      imageUrl = await uploadPhotoToCloudinary(req.file);
+    } catch (uploadErr) {
+      console.warn("Lost & found image upload skipped:", uploadErr.message);
+      imageUrl = null;
+    }
+  }
   const postedBy = req.user?._id || req.body.postedBy;
+  const verification = normalizeVerificationInput(req.body);
   const item = await LostFound.create({
-    ...req.body,
+    ...normalizeLocationPayload(req.body),
     postedBy,
     imageUrl,
+    verification,
   });
 
-  res.status(201).json(item);
+  const safeItem = item.toObject();
+  delete safeItem.verification;
+
+  res.status(201).json(safeItem);
 
   void runGeminiMatchBackground(item);
 };
 
+const matchLostFoundItems = async (req, res) => {
+  try {
+    const newItem = normalizeLocationPayload(req.body);
+    if (req.body.id && !newItem._id) {
+      newItem._id = req.body.id;
+    }
+    const matches = await matchItems(newItem);
+    res.json({ matches });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+const getNearbyLostFoundItems = async (req, res) => {
+  try {
+    const nearby = await findNearbyItems({
+      itemId: req.query.itemId,
+      lat: req.query.lat,
+      lng: req.query.lng,
+      radiusMeters: req.query.radiusMeters || req.query.radius || 500,
+      status: req.query.status,
+      limit: req.query.limit,
+    });
+
+    res.json(nearby);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
 const runGeminiMatchBackground = async (item) => {
   try {
-    const oppositeStatus = item.status === "lost" ? "found" : "lost";
-    const candidates = await LostFound.find({
-      status: oppositeStatus,
-      _id: { $ne: item._id },
-      location: { $regex: item.location || "", $options: "i" },
-    })
-      .limit(10)
-      .populate("postedBy", "name email");
+    const matches = await matchItems(item);
+    const candidates = matches.slice(0, 10);
 
     if (!candidates.length) {
       return;
     }
 
-    for (const candidate of candidates) {
-      const prompt = `You are a campus lost-and-found match assistant. Compare a newly posted item with an existing candidate item. Respond only with valid JSON using keys matchScore (number 0-100) and matchReason (string).\n\nNew item:\nTitle: ${item.title}\nDescription: ${item.description}\nLocation: ${item.location || "N/A"}\nStatus: ${item.status}\nImageUrl: ${item.imageUrl || "N/A"}\n\nCandidate item:\nTitle: ${candidate.title}\nDescription: ${candidate.description}\nLocation: ${candidate.location || "N/A"}\nStatus: ${candidate.status}\nImageUrl: ${candidate.imageUrl || "N/A"}`;
+    for (const match of candidates) {
+      const candidate = match.item;
+      const prompt = `You are a campus lost-and-found match assistant. Compare a newly posted item with an existing candidate item. Respond only with valid JSON using keys matchScore (number 0-100) and matchReason (string).\n\nNew item:\nTitle: ${item.title}\nDescription: ${item.description}\nLocation: ${item.locationName || item.location || "N/A"}\nStatus: ${item.status}\nImageUrl: ${item.imageUrl || "N/A"}\n\nCandidate item:\nTitle: ${candidate.title}\nDescription: ${candidate.description}\nLocation: ${candidate.locationName || candidate.location || "N/A"}\nStatus: ${candidate.status}\nImageUrl: ${candidate.imageUrl || "N/A"}\nDistanceMeters: ${match.distanceMeters ?? "N/A"}\nNearbyWithin500m: ${match.nearby ? "yes" : "no"}\nRuleBasedScore: ${match.score}`;
 
       const response = await gemini.textClient.chat([
         {
@@ -84,6 +171,11 @@ const runGeminiMatchBackground = async (item) => {
       const matchResult = parseGeminiJson(text);
       if (!matchResult || typeof matchResult.matchScore !== "number") {
         continue;
+      }
+
+      if (match.nearby) {
+        matchResult.matchScore = Math.min(matchResult.matchScore + 10, 100);
+        matchResult.matchReason = `${matchResult.matchReason} Nearby location increased confidence.`;
       }
 
       const threshold = 80;
@@ -122,30 +214,6 @@ const notifyUsersOfMatch = async (item, candidate, matchResult) => {
   }
 };
 
-const claimItem = async (req, res) => {
-  const item = await LostFound.findById(req.params.id).populate(
-    "postedBy",
-    "name email",
-  );
-  if (!item) {
-    return res.status(404).json({ message: "Item not found" });
-  }
-
-  item.status = "claimed";
-  item.claimedBy = req.body.userId || req.user?._id;
-  await item.save();
-
-  if (item.postedBy?.email) {
-    await sendEmail({
-      to: item.postedBy.email,
-      subject: "Thank you for helping with a lost and found item",
-      text: `Hello ${item.postedBy.name || "Campus user"},\n\nThank you for reporting this item. It has been marked resolved and the claim process completed successfully. Your help keeps campus property safe.`,
-    });
-  }
-
-  res.json(item);
-};
-
 const searchItems = async (req, res) => {
   const query = req.query.q || "";
   const results = await LostFound.find({
@@ -153,9 +221,29 @@ const searchItems = async (req, res) => {
       { title: { $regex: query, $options: "i" } },
       { description: { $regex: query, $options: "i" } },
       { location: { $regex: query, $options: "i" } },
+      { locationName: { $regex: query, $options: "i" } },
     ],
-  }).sort({ createdAt: -1 });
+  })
+    .sort({ createdAt: -1 })
+    .populate("postedBy", "name")
+    .select("-verification");
   res.json(results);
 };
 
-module.exports = { createLostFound, claimItem, searchItems };
+const listLostFoundItems = async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 60, 100);
+  const items = await LostFound.find()
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .populate("postedBy", "name")
+    .select("-verification");
+  res.json(items);
+};
+
+module.exports = {
+  createLostFound,
+  searchItems,
+  matchLostFoundItems,
+  getNearbyLostFoundItems,
+  listLostFoundItems,
+};

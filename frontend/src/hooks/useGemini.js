@@ -1,18 +1,29 @@
 import { useState } from "react";
-import { askGemini } from "../api/geminiAPI";
+import { performGeminiAction } from "../api/geminiAPI";
 
 const useGemini = () => {
   const [response, setResponse] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
-  const queryGemini = async (prompt) => {
+  const queryGemini = async (message, options = {}) => {
     setLoading(true);
-    const result = await askGemini(prompt);
-    setResponse(result.data);
-    setLoading(false);
+    setError(null);
+
+    try {
+      const result = await performGeminiAction(message, options);
+      setResponse(result.data);
+      return result.data;
+    } catch (err) {
+      const errorMessage = err.response?.data?.error || err.message;
+      setError(errorMessage);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
   };
 
-  return { response, loading, queryGemini };
+  return { response, loading, error, queryGemini };
 };
 
 export default useGemini;

@@ -5,6 +5,7 @@ const usedQRTokens = new Set();
 
 const encodeQRData = (payload) =>
   Buffer.from(JSON.stringify(payload)).toString("base64");
+
 const decodeQRData = (token) => {
   try {
     return JSON.parse(token);
@@ -14,31 +15,36 @@ const decodeQRData = (token) => {
   }
 };
 
-const generateQR = async ({ sessionId, subject, expiresAt }) => {
-  if (!sessionId || !subject || !expiresAt) {
+/**
+ * @param {{ sessionId: string, subject?: string, classroom?: string, expiresAt: number | string | Date }} params
+ */
+const generateQR = async ({ sessionId, subject, classroom, expiresAt }) => {
+  const room = subject || classroom;
+  if (!sessionId || !room || !expiresAt) {
     throw new Error(
-      "sessionId, subject, and expiresAt are required to generate a QR code",
+      "sessionId, subject (or classroom), and expiresAt are required to generate a QR code",
     );
   }
 
   const qrPayload = {
     tokenId: randomUUID(),
     sessionId,
-    subject,
+    subject: room,
+    classroom: room,
     expiresAt: new Date(expiresAt).toISOString(),
   };
 
-  const payloadString = JSON.stringify(qrPayload);
-  const dataUrl = await QRCode.toDataURL(payloadString, {
+  const token = encodeQRData(qrPayload);
+  const dataUrl = await QRCode.toDataURL(token, {
     type: "image/png",
     errorCorrectionLevel: "H",
     margin: 2,
-    width: 300,
+    width: 320,
   });
 
   return {
     qrBase64: dataUrl,
-    token: encodeQRData(qrPayload),
+    token,
     payload: qrPayload,
   };
 };
@@ -77,4 +83,53 @@ const verifyQRToken = (token) => {
   return { sessionId, subject, expiresAt: expiry.toISOString(), tokenId };
 };
 
-module.exports = { generateQR, verifyQRToken };
+/**
+ * Session QR for class attendance: time-limited, reusable until expiry (no single-use).
+ * @param {string} raw — scanned string (base64 token or JSON)
+ */
+const verifyAttendanceSessionToken = (raw) => {
+  if (!raw || typeof raw !== "string") {
+    throw new Error("Scan payload is required");
+  }
+
+  const trimmed = raw.trim();
+  let payload;
+  try {
+    if (trimmed.startsWith("{")) {
+      payload = JSON.parse(trimmed);
+    } else {
+      payload = decodeQRData(trimmed);
+    }
+  } catch {
+    throw new Error("Invalid attendance QR payload");
+  }
+
+  const room = payload.classroom || payload.subject;
+  const { sessionId, expiresAt } = payload;
+  if (!sessionId || !room || !expiresAt) {
+    throw new Error("Attendance QR is missing required fields");
+  }
+
+  const expiry = new Date(expiresAt);
+  if (Number.isNaN(expiry.getTime())) {
+    throw new Error("Attendance QR expiry is invalid");
+  }
+
+  if (expiry < new Date()) {
+    throw new Error("Attendance QR has expired");
+  }
+
+  return {
+    sessionId,
+    classroom: room,
+    expiresAt: expiry.toISOString(),
+  };
+};
+
+module.exports = {
+  generateQR,
+  verifyQRToken,
+  verifyAttendanceSessionToken,
+  encodeQRData,
+  decodeQRData,
+};

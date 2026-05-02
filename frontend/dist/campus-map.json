@@ -1,0 +1,18 @@
+[
+  {
+    "id": "library",
+    "name": "Main Library",
+    "description": "Central campus library",
+    "latitude": 40.7128,
+    "longitude": -74.0060,
+    "category": "building"
+  },
+  {
+    "id": "student-center",
+    "name": "Student Center",
+    "description": "Dining and student services",
+    "latitude": 40.7138,
+    "longitude": -74.0070,
+    "category": "service"
+  }
+]

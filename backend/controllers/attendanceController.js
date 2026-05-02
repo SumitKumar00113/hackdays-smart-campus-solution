@@ -1,9 +1,21 @@
 const crypto = require("crypto");
 const Attendance = require("../models/Attendance");
 const User = require("../models/User");
-const generateQR = require("../utils/generateQR");
-const sendEmail = require("../utils/sendEmail");
+const {
+  generateQR,
+  verifyAttendanceSessionToken,
+} = require("../utils/generateQR");
+const { isValidDescriptor, compareDescriptors } = require("../utils/faceMatch");
+const { sendEmail } = require("../utils/sendEmail");
 const initGemini = require("../config/gemini");
+const {
+  predictAttendanceRisk,
+} = require("../services/attendancePredictionService");
+const { notifyAttendanceRisk } = require("../services/notificationService");
+const {
+  issueRoomSessionCode,
+  redeemRoomSessionCode,
+} = require("../services/roomSessionCodeService");
 
 const gemini = initGemini();
 
@@ -90,6 +102,23 @@ const formatCSV = (rows) => {
   return [header, ...lines].join("\n");
 };
 
+const extractGeminiText = (result) => {
+  if (!result) return null;
+  if (typeof result === "string") return result;
+  if (result.outputText) return result.outputText;
+  if (result.text) return result.text;
+  if (result.candidates?.[0]?.content?.parts?.[0]?.text)
+    return result.candidates[0].content.parts
+      .map((part) => part.text)
+      .filter(Boolean)
+      .join("\n");
+  if (result.candidates?.[0]?.content?.[0]?.text)
+    return result.candidates[0].content[0].text;
+  if (result.choices?.[0]?.message?.content)
+    return result.choices[0].message.content;
+  return JSON.stringify(result);
+};
+
 const markAttendance = async (req, res) => {
   const { student, classroom, date, status } = req.body;
   if (!student || !classroom || !status) {
@@ -103,7 +132,13 @@ const markAttendance = async (req, res) => {
 
   const record = await Attendance.findOneAndUpdate(
     { student, classroom, date: { $gte: start, $lte: end } },
-    { student, classroom, date: attendanceDate, status },
+    {
+      student,
+      classroom,
+      date: attendanceDate,
+      status,
+      checkInMethod: "manual",
+    },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
@@ -111,57 +146,229 @@ const markAttendance = async (req, res) => {
 };
 
 const generateQRCode = async (req, res) => {
-  const { classroom, durationMinutes = 15 } = req.body;
-  if (!classroom) {
+  const { classroom, durationMinutes = 45 } = req.body;
+  if (!classroom?.trim()) {
     return res.status(400).json({ message: "classroom is required" });
   }
 
-  const payload = {
-    sessionId: crypto.randomUUID(),
-    classroom,
-    expiresAt: Date.now() + durationMinutes * 60 * 1000,
-  };
-  const qrCode = await generateQR(payload);
+  const sessionId = crypto.randomUUID();
+  const expiresAt = Date.now() + Number(durationMinutes) * 60 * 1000;
 
-  res.json({ qrCode, ...payload });
+  try {
+    const { qrBase64, token, payload } = await generateQR({
+      sessionId,
+      classroom: classroom.trim(),
+      expiresAt,
+    });
+
+    res.json({
+      qrImage: qrBase64,
+      token,
+      sessionId,
+      classroom: payload.classroom,
+      expiresAt: payload.expiresAt,
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
 };
 
 const verifyQR = async (req, res) => {
-  const { qrCode, studentId } = req.body;
-  if (!qrCode || !studentId) {
-    return res
-      .status(400)
-      .json({ message: "qrCode and studentId are required" });
+  const { qrCode, studentId, token } = req.body;
+  const raw = (token || qrCode || "").trim();
+  if (!raw || !studentId) {
+    return res.status(400).json({
+      message: "qrCode or token, and studentId are required",
+    });
   }
 
-  let payload;
+  let classroom;
   try {
-    payload = parseQR(qrCode);
+    if (raw.startsWith("QR_CODE_FOR_")) {
+      const payload = parseQR(raw);
+      if (Date.now() > payload.expiresAt) {
+        return res.status(400).json({ message: "QR code has expired" });
+      }
+      classroom = payload.classroom;
+    } else {
+      const session = verifyAttendanceSessionToken(raw);
+      classroom = session.classroom;
+    }
   } catch (error) {
     return res.status(400).json({ message: error.message });
-  }
-
-  if (Date.now() > payload.expiresAt) {
-    return res.status(400).json({ message: "QR code has expired" });
   }
 
   const { start, end } = normalizeDateRange(new Date());
   const record = await Attendance.findOneAndUpdate(
     {
       student: studentId,
-      classroom: payload.classroom,
+      classroom,
       date: { $gte: start, $lte: end },
     },
     {
       student: studentId,
-      classroom: payload.classroom,
+      classroom,
       date: new Date(),
       status: "present",
+      checkInMethod: "qr_face",
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
   res.json({ message: "Attendance marked present", record });
+};
+
+const enrollFace = async (req, res) => {
+  const { descriptor } = req.body;
+  const userId = req.user._id;
+
+  if (!isValidDescriptor(descriptor)) {
+    return res.status(400).json({
+      message:
+        "descriptor must be an array of 128 numbers (face-api recognition vector)",
+    });
+  }
+
+  await User.findByIdAndUpdate(userId, {
+    faceDescriptor: descriptor,
+    faceEnrolledAt: new Date(),
+  });
+
+  res.json({ message: "Face enrollment saved", enrolled: true });
+};
+
+const getFaceEnrollment = async (req, res) => {
+  const user = await User.findById(req.user._id).select(
+    "+faceDescriptor +faceEnrolledAt",
+  );
+  const enrolled = Boolean(user?.faceDescriptor?.length === 128);
+  res.json({
+    enrolled,
+    enrolledAt: user?.faceEnrolledAt || null,
+  });
+};
+
+const verifyScan = async (req, res) => {
+  const { token, faceDescriptor } = req.body;
+  const studentId = req.user._id;
+
+  if (!token || typeof token !== "string") {
+    return res
+      .status(400)
+      .json({ message: "token (scanned QR payload) is required" });
+  }
+
+  if (!isValidDescriptor(faceDescriptor)) {
+    return res.status(400).json({
+      message:
+        "faceDescriptor must be a 128-number vector from the same model as enrollment",
+    });
+  }
+
+  let session;
+  try {
+    session = verifyAttendanceSessionToken(token.trim());
+  } catch (error) {
+    return res.status(400).json({ message: error.message });
+  }
+
+  const user = await User.findById(studentId).select("+faceDescriptor");
+  if (!user?.faceDescriptor?.length) {
+    return res.status(400).json({
+      message: "Enroll your face before using QR check-in.",
+    });
+  }
+
+  const { distance, match } = compareDescriptors(
+    user.faceDescriptor,
+    faceDescriptor,
+  );
+
+  if (!match) {
+    return res.status(403).json({
+      message:
+        "Face verification failed. Use the same lighting as enrollment and face the camera.",
+      distance,
+    });
+  }
+
+  const { start, end } = normalizeDateRange(new Date());
+  const record = await Attendance.findOneAndUpdate(
+    {
+      student: studentId,
+      classroom: session.classroom,
+      date: { $gte: start, $lte: end },
+    },
+    {
+      student: studentId,
+      classroom: session.classroom,
+      date: new Date(),
+      status: "present",
+      checkInMethod: "qr_face",
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+
+  res.json({
+    message: "Attendance marked present (QR + face verified)",
+    record,
+    sessionId: session.sessionId,
+    distance,
+  });
+};
+
+/** POST body: { classroom, durationMinutes } — instructor shows code in the selected room only. */
+const issueRoomCode = async (req, res) => {
+  try {
+    const { classroom, durationMinutes = 45 } = req.body;
+    const out = issueRoomSessionCode({
+      classroom,
+      durationMinutes,
+      issuedBy: req.user._id,
+    });
+    res.json(out);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+/** POST body: { code } — student must be in class to see the code; binds to that room. */
+const redeemRoomCode = async (req, res) => {
+  const studentId = req.user._id;
+  const { code } = req.body;
+
+  try {
+    const { classroom, sessionId } = redeemRoomSessionCode({
+      code,
+      studentId,
+    });
+    const { start, end } = normalizeDateRange(new Date());
+    const record = await Attendance.findOneAndUpdate(
+      {
+        student: studentId,
+        classroom,
+        date: { $gte: start, $lte: end },
+      },
+      {
+        student: studentId,
+        classroom,
+        date: new Date(),
+        status: "present",
+        checkInMethod: "room_code",
+        roomSessionId: sessionId,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    res.json({
+      message: `Present — checked in for ${classroom} using the room session code.`,
+      record,
+      classroom,
+      sessionId,
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
 };
 
 const saveMoodSnapshot = async (req, res) => {
@@ -276,6 +483,56 @@ const getAIInsights = async (req, res) => {
   });
 };
 
+const getAttendancePrediction = async (req, res) => {
+  const { totalClasses, attendedClasses, upcomingClasses, threshold } = req.query;
+
+  try {
+    const prediction = predictAttendanceRisk({
+      totalClasses,
+      attendedClasses,
+      upcomingClasses,
+      threshold,
+    });
+
+    if (req.query.explain === "true") {
+      try {
+        const response = await gemini.textClient.chat([
+          {
+            role: "system",
+            content:
+              "You explain attendance risk to students in one concise, supportive paragraph.",
+          },
+          {
+            role: "user",
+            content: `Explain this attendance prediction: ${JSON.stringify(prediction)}`,
+          },
+        ]);
+
+        prediction.aiExplanation = extractGeminiText(response);
+      } catch (error) {
+        console.warn("Gemini attendance prediction explanation failed:", error.message);
+        prediction.aiExplanation = "AI explanation is unavailable right now.";
+      }
+    }
+
+    const userId = req.user?._id || req.query.userId || req.query.studentId;
+    if (prediction.risk && userId) {
+      const notification = await notifyAttendanceRisk({
+        userId,
+        prediction,
+        email: req.query.email,
+      });
+      if (notification) {
+        prediction.notification = notification;
+      }
+    }
+
+    res.json(prediction);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
 const getAttendance = async (req, res) => {
   const records = await Attendance.find().populate("student", "name email");
   res.json(records);
@@ -302,8 +559,14 @@ module.exports = {
   markAttendance,
   generateQRCode,
   verifyQR,
+  enrollFace,
+  getFaceEnrollment,
+  verifyScan,
+  issueRoomCode,
+  redeemRoomCode,
   saveMoodSnapshot,
   getAIInsights,
+  getAttendancePrediction,
   getAttendance,
   exportAttendance,
 };

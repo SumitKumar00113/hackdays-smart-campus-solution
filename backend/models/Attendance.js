@@ -27,6 +27,14 @@ const attendanceSchema = new mongoose.Schema({
     enum: ["happy", "distressed", "disengaged", "neutral"],
   },
   moodSnapshots: [moodSnapshotSchema],
+  /** How the row was created: manual form, QR+face, or in-room session code */
+  checkInMethod: {
+    type: String,
+    enum: ["manual", "qr_face", "room_code"],
+    default: "manual",
+  },
+  /** Server session id from issue-room-code (audit / anti-abuse) */
+  roomSessionId: { type: String },
   createdAt: { type: Date, default: Date.now },
 });
 

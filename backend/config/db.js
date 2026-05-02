@@ -22,14 +22,16 @@ const connectDB = async () => {
     console.error("MongoDB connection error:", err.message);
   });
 
+  const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
+  if (!uri || typeof uri !== "string") {
+    console.error(
+      "Set MONGODB_URI (or MONGO_URI) in backend/.env — e.g. mongodb://127.0.0.1:27017/smart-campus",
+    );
+    process.exit(1);
+  }
+
   try {
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      autoReconnect: true,
-      reconnectTries: Number.MAX_VALUE,
-      reconnectInterval: 1000,
-    });
+    await mongoose.connect(uri);
   } catch (error) {
     console.error("MongoDB connection error:", error.message);
     process.exit(1);

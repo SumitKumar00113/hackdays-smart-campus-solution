@@ -1,6 +1,9 @@
 const express = require("express");
 const router = express.Router();
+const authMiddleware = require("../middleware/authMiddleware");
 const {
+  askGemini,
+  geminiAction,
   campusChat,
   summarizeNotice,
   matchLostItem,
@@ -11,8 +14,12 @@ const {
   evaluateAnswer,
   classifySOSThreat,
   aiPeerMatch,
+  suggestStudySessions,
 } = require("../controllers/geminiController");
 
+router.post("/study-suggestions", authMiddleware, suggestStudySessions);
+router.post("/ask", askGemini);
+router.post("/action", geminiAction);
 router.post("/campus-chat", campusChat);
 router.post("/summarize-notice", summarizeNotice);
 router.post("/match-lost-item", matchLostItem);

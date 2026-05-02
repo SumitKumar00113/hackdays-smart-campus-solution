@@ -10,12 +10,26 @@
   },
   "dependencies": {
     "axios": "^1.5.1",
+    "face-api.js": "^0.22.2",
+    "framer-motion": "^11.18.2",
+    "hls.js": "^1.6.16",
+    "html5-qrcode": "^2.3.8",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^1.14.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.18.0"
+    "react-leaflet": "^4.2.1",
+    "react-router-dom": "^6.18.0",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.13",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^6.0.3",
     "vite": "^5.4.1"
   }
 }

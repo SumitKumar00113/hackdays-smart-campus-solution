@@ -1,6 +1,7 @@
 const dotenv = require("dotenv");
 const connectDB = require("../config/db");
 const CampusMap = require("../models/CampusMap");
+const { getCampusOrigin } = require("../utils/campusOrigin");
 
 dotenv.config();
 
@@ -8,19 +9,41 @@ const seedMap = async () => {
   await connectDB();
   await CampusMap.deleteMany({});
 
+  const { lat: O_LAT, lng: O_LNG } = getCampusOrigin();
   const markers = [
     {
-      name: "Main Library",
-      description: "Central campus library",
-      latitude: 40.7128,
-      longitude: -74.006,
+      name: "TIT — Main gate",
+      description: "Technocrats Institute of Technology, main entrance",
+      latitude: O_LAT + 0.00035,
+      longitude: O_LNG + 0.00015,
+      category: "landmark",
+    },
+    {
+      name: "Central library",
+      description: "Reading hall & digital resources",
+      latitude: O_LAT - 0.00025,
+      longitude: O_LNG + 0.0004,
       category: "building",
     },
     {
-      name: "Student Center",
-      description: "Dining and student services",
-      latitude: 40.7138,
-      longitude: -74.007,
+      name: "Academic block",
+      description: "Lecture halls & faculty offices",
+      latitude: O_LAT + 0.0002,
+      longitude: O_LNG - 0.00035,
+      category: "building",
+    },
+    {
+      name: "Workshops & labs",
+      description: "Engineering labs",
+      latitude: O_LAT + 0.00045,
+      longitude: O_LNG + 0.0005,
+      category: "building",
+    },
+    {
+      name: "Canteen / food court",
+      description: "Student dining",
+      latitude: O_LAT - 0.00055,
+      longitude: O_LNG - 0.0002,
       category: "service",
     },
   ];
